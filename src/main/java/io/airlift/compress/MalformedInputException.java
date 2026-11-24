@@ -29,6 +29,12 @@ public class MalformedInputException
         this.offset = offset;
     }
 
+    public MalformedInputException(long offset, String reason, Throwable cause)
+    {
+        super(reason + ": offset=" + offset, cause);
+        this.offset = offset;
+    }
+
     public long getOffset()
     {
         return offset;

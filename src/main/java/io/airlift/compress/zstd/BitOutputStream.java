@@ -14,7 +14,6 @@
 package io.airlift.compress.zstd;
 
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
-import static io.airlift.compress.zstd.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Util.checkArgument;
 
 class BitOutputStream
@@ -65,7 +64,7 @@ class BitOutputStream
     {
         int bytes = bitCount >>> 3;
 
-        UNSAFE.putLong(outputBase, currentAddress, container);
+        Memory.putLong(outputBase, currentAddress, container);
         currentAddress += bytes;
 
         if (currentAddress > outputLimit) {

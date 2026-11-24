@@ -21,7 +21,7 @@ import static io.airlift.compress.zstd.Util.checkPositionIndexes;
 import static io.airlift.compress.zstd.Util.checkState;
 import static java.lang.Math.max;
 import static java.util.Objects.requireNonNull;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.zstd.Memory.ARRAY_BYTE_BASE_OFFSET;
 
 public class ZstdInputStream
         extends InputStream
@@ -50,9 +50,21 @@ public class ZstdInputStream
      */
     public ZstdInputStream(InputStream inputStream, int maxWindowSize)
     {
-        this.decompressor = new ZstdIncrementalFrameDecompressor(maxWindowSize);
-        this.inputBuffer = new byte[decompressor.getInputRequired()];
+        this(inputStream, new ZstdIncrementalFrameDecompressor(maxWindowSize));
+    }
+
+    /**
+     * Decodes with a caller-owned decoder that is reset and then reused, so a client opening one stream per file does not
+     * re-allocate the ~400 KB of window, table and input buffers each time. One decoder serves one open stream at a time:
+     * creating a new stream on it makes the previous stream fail with an IOException on its next read.
+     */
+    public ZstdInputStream(InputStream inputStream, ZstdIncrementalFrameDecompressor decompressor)
+    {
         this.inputStream = requireNonNull(inputStream, "inputStream is null");
+        this.decompressor = requireNonNull(decompressor, "decompressor is null");
+        decompressor.reset();
+        decompressor.owner = this;
+        this.inputBuffer = decompressor.streamInputBuffer;
     }
 
     @Override
@@ -76,6 +88,9 @@ public class ZstdInputStream
     {
         if (closed) {
             throw new IOException("Stream is closed");
+        }
+        if (decompressor.owner != this) {
+            throw new IOException("The decoder of this stream was reused by another stream");
         }
 
         if (outputBuffer == null) {
@@ -128,6 +143,7 @@ public class ZstdInputStream
 
         if (inputBuffer.length < requiredSize) {
             inputBuffer = Arrays.copyOf(inputBuffer, max(requiredSize, MIN_BUFFER_SIZE));
+            decompressor.streamInputBuffer = inputBuffer;
         }
 
         while (inputBufferLimit < inputBuffer.length) {

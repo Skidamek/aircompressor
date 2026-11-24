@@ -16,14 +16,17 @@ package io.airlift.compress.zstd;
 import io.airlift.compress.Decompressor;
 import io.airlift.compress.MalformedInputException;
 
-import java.nio.Buffer;
 import java.nio.ByteBuffer;
 
-import static io.airlift.compress.zstd.UnsafeUtil.getAddress;
+import static io.airlift.compress.zstd.Memory.ARRAY_BYTE_BASE_OFFSET;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
 
+/**
+ * One-shot zstd decoder. Reusing one instance across calls avoids re-allocating its ~150 KB of tables and buffers.
+ * Instances are not thread safe. Heap arrays and heap buffers, direct buffers and {@link java.nio.MappedByteBuffer}s are
+ * all accessed with JVM bounds checks; corrupt input fails with {@link MalformedInputException}.
+ */
 public class ZstdDecompressor
         implements Decompressor
 {
@@ -48,59 +51,10 @@ public class ZstdDecompressor
     public void decompress(ByteBuffer inputBuffer, ByteBuffer outputBuffer)
             throws MalformedInputException
     {
-        // Java 9+ added an overload of various methods in ByteBuffer. When compiling with Java 11+ and targeting Java 8 bytecode
-        // the resulting signatures are invalid for JDK 8, so accesses below result in NoSuchMethodError. Accessing the
-        // methods through the interface class works around the problem
-        // Sidenote: we can't target "javac --release 8" because Unsafe is not available in the signature data for that profile
-        Buffer input = inputBuffer;
-        Buffer output = outputBuffer;
-
-        Object inputBase;
-        long inputAddress;
-        long inputLimit;
-        if (input.isDirect()) {
-            inputBase = null;
-            long address = getAddress(input);
-            inputAddress = address + input.position();
-            inputLimit = address + input.limit();
-        }
-        else if (input.hasArray()) {
-            inputBase = input.array();
-            inputAddress = ARRAY_BYTE_BASE_OFFSET + input.arrayOffset() + input.position();
-            inputLimit = ARRAY_BYTE_BASE_OFFSET + input.arrayOffset() + input.limit();
-        }
-        else {
-            throw new IllegalArgumentException("Unsupported input ByteBuffer implementation " + input.getClass().getName());
-        }
-
-        Object outputBase;
-        long outputAddress;
-        long outputLimit;
-        if (output.isDirect()) {
-            outputBase = null;
-            long address = getAddress(output);
-            outputAddress = address + output.position();
-            outputLimit = address + output.limit();
-        }
-        else if (output.hasArray()) {
-            outputBase = output.array();
-            outputAddress = ARRAY_BYTE_BASE_OFFSET + output.arrayOffset() + output.position();
-            outputLimit = ARRAY_BYTE_BASE_OFFSET + output.arrayOffset() + output.limit();
-        }
-        else {
-            throw new IllegalArgumentException("Unsupported output ByteBuffer implementation " + output.getClass().getName());
-        }
-
-        // HACK: Assure JVM does not collect Slice wrappers while decompressing, since the
-        // collection may trigger freeing of the underlying memory resulting in a segfault
-        // There is no other known way to signal to the JVM that an object should not be
-        // collected in a block, and technically, the JVM is allowed to eliminate these locks.
-        synchronized (input) {
-            synchronized (output) {
-                int written = decompressor.decompress(inputBase, inputAddress, inputLimit, outputBase, outputAddress, outputLimit);
-                output.position(output.position() + written);
-            }
-        }
+        int written = decompressor.decompress(
+                Memory.base(inputBuffer), Memory.address(inputBuffer, inputBuffer.position()), Memory.address(inputBuffer, inputBuffer.limit()),
+                Memory.base(outputBuffer), Memory.address(outputBuffer, outputBuffer.position()), Memory.address(outputBuffer, outputBuffer.limit()));
+        outputBuffer.position(outputBuffer.position() + written);
     }
 
     /**
@@ -136,65 +90,32 @@ public class ZstdDecompressor
     public void decompressWithPrefix(ByteBuffer inputBuffer, ByteBuffer outputBuffer, ByteBuffer prefixBuffer)
             throws MalformedInputException
     {
-        Buffer input = inputBuffer;
-        Buffer output = outputBuffer;
-        Buffer prefix = prefixBuffer;
-        Object inputBase = base(input);
-        long inputAddress = address(input) + input.position();
-        long inputLimit = address(input) + input.limit();
-        Object outputBase = base(output);
-        long outputAddress = address(output) + output.position();
-        long outputLimit = address(output) + output.limit();
-        Object prefixBase = base(prefix);
-        long prefixAddress = address(prefix) + prefix.position();
-        long prefixLimit = address(prefix) + prefix.limit();
-        if (inputAddress == inputLimit) {
+        if (inputBuffer.remaining() == 0) {
             throw new MalformedInputException(0, "No zstd frame");
         }
-
-        // see decompress(ByteBuffer, ByteBuffer): keep the buffers reachable while their memory is accessed
-        synchronized (input) {
-            synchronized (output) {
-                synchronized (prefix) {
-                    int written = decompressor.decompress(inputBase, inputAddress, inputLimit, outputBase, outputAddress, outputLimit, prefixBase, prefixAddress, prefixLimit);
-                    output.position(output.position() + written);
-                }
-            }
-        }
-    }
-
-    private static Object base(Buffer buffer)
-    {
-        if (buffer.isDirect()) {
-            return null;
-        }
-        if (buffer.hasArray()) {
-            return buffer.array();
-        }
-        throw new IllegalArgumentException("Unsupported ByteBuffer implementation " + buffer.getClass().getName());
-    }
-
-    private static long address(Buffer buffer)
-    {
-        if (buffer.isDirect()) {
-            return getAddress(buffer);
-        }
-        if (buffer.isReadOnly()) {
-            throw new IllegalArgumentException("Read-only heap ByteBuffers are not supported");
-        }
-        return ARRAY_BYTE_BASE_OFFSET + buffer.arrayOffset();
+        int written = decompressor.decompress(
+                Memory.base(inputBuffer), Memory.address(inputBuffer, inputBuffer.position()), Memory.address(inputBuffer, inputBuffer.limit()),
+                Memory.base(outputBuffer), Memory.address(outputBuffer, outputBuffer.position()), Memory.address(outputBuffer, outputBuffer.limit()),
+                Memory.base(prefixBuffer), Memory.address(prefixBuffer, prefixBuffer.position()), Memory.address(prefixBuffer, prefixBuffer.limit()));
+        outputBuffer.position(outputBuffer.position() + written);
     }
 
     public static long getDecompressedSize(byte[] input, int offset, int length)
     {
-        int baseAddress = ARRAY_BYTE_BASE_OFFSET + offset;
-        return ZstdFrameDecompressor.getDecompressedSize(input, baseAddress, baseAddress + length);
+        verifyRange(input, offset, length);
+        long baseAddress = ARRAY_BYTE_BASE_OFFSET + offset;
+        try {
+            return ZstdFrameDecompressor.getDecompressedSize(input, baseAddress, baseAddress + length);
+        }
+        catch (IndexOutOfBoundsException e) {
+            throw new MalformedInputException(0, "Input is corrupted", e);
+        }
     }
 
     private static void verifyRange(byte[] data, int offset, int length)
     {
         requireNonNull(data, "data is null");
-        if (offset < 0 || length < 0 || offset + length > data.length) {
+        if (offset < 0 || length < 0 || offset > data.length - length) {
             throw new IllegalArgumentException(format("Invalid offset or length (%s, %s) in array of length %s", offset, length, data.length));
         }
     }

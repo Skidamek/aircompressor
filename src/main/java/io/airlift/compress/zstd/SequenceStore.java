@@ -14,8 +14,7 @@
 package io.airlift.compress.zstd;
 
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
-import static io.airlift.compress.zstd.UnsafeUtil.UNSAFE;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.zstd.Memory.ARRAY_BYTE_BASE_OFFSET;
 
 class SequenceStore
 {
@@ -74,7 +73,7 @@ class SequenceStore
 
     public void appendLiterals(Object inputBase, long inputAddress, int inputSize)
     {
-        UNSAFE.copyMemory(inputBase, inputAddress, literalsBuffer, ARRAY_BYTE_BASE_OFFSET + literalsLength, inputSize);
+        Memory.copyMemory(inputBase, inputAddress, literalsBuffer, ARRAY_BYTE_BASE_OFFSET + literalsLength, inputSize);
         literalsLength += inputSize;
     }
 
@@ -84,7 +83,7 @@ class SequenceStore
         long output = ARRAY_BYTE_BASE_OFFSET + literalsLength;
         int copied = 0;
         do {
-            UNSAFE.putLong(literalsBuffer, output, UNSAFE.getLong(literalBase, input));
+            Memory.putLong(literalsBuffer, output, Memory.getLong(literalBase, input));
             input += SIZE_OF_LONG;
             output += SIZE_OF_LONG;
             copied += SIZE_OF_LONG;

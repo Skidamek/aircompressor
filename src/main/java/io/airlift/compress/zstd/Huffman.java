@@ -19,7 +19,6 @@ import static io.airlift.compress.zstd.BitInputStream.isEndOfStream;
 import static io.airlift.compress.zstd.BitInputStream.peekBitsFast;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_INT;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_SHORT;
-import static io.airlift.compress.zstd.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Util.isPowerOf2;
 import static io.airlift.compress.zstd.Util.verify;
 
@@ -56,7 +55,7 @@ class Huffman
 
         // read table header
         verify(size > 0, input, "Not enough input bytes");
-        int inputSize = UNSAFE.getByte(inputBase, input++) & 0xFF;
+        int inputSize = Memory.getByte(inputBase, input++) & 0xFF;
 
         int outputSize;
         if (inputSize >= 128) {
@@ -67,7 +66,7 @@ class Huffman
             verify(outputSize <= MAX_SYMBOL + 1, input, "Input is corrupted");
 
             for (int i = 0; i < outputSize; i += 2) {
-                int value = UNSAFE.getByte(inputBase, input + i / 2) & 0xFF;
+                int value = Memory.getByte(inputBase, input + i / 2) & 0xFF;
                 weights[i] = (byte) (value >>> 4);
                 weights[i + 1] = (byte) (value & 0b1111);
             }
@@ -169,9 +168,9 @@ class Huffman
         verify(inputLimit - inputAddress >= 10, inputAddress, "Input is corrupted"); // jump table + 1 byte per stream
 
         long start1 = inputAddress + 3 * SIZE_OF_SHORT; // for the shorts we read below
-        long start2 = start1 + (UNSAFE.getShort(inputBase, inputAddress) & 0xFFFF);
-        long start3 = start2 + (UNSAFE.getShort(inputBase, inputAddress + 2) & 0xFFFF);
-        long start4 = start3 + (UNSAFE.getShort(inputBase, inputAddress + 4) & 0xFFFF);
+        long start2 = start1 + (Memory.getShort(inputBase, inputAddress) & 0xFFFF);
+        long start3 = start2 + (Memory.getShort(inputBase, inputAddress + 2) & 0xFFFF);
+        long start4 = start3 + (Memory.getShort(inputBase, inputAddress + 4) & 0xFFFF);
 
         verify(start2 < start3 && start3 < start4 && start4 < inputLimit, inputAddress, "Input is corrupted");
 
@@ -215,7 +214,106 @@ class Huffman
         byte[] numbersOfBits = this.numbersOfBits;
         byte[] symbols = this.symbols;
 
-        while (output4 < fastOutputLimit) {
+        // byte[] output (always the case for the frame decoder): pack each stream's four symbols into one bounds-checked int store
+        byte[] outputArray = outputBase instanceof byte[] ? (byte[]) outputBase : null;
+        while (outputArray != null && output4 < fastOutputLimit) {
+            int value;
+                value = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
+                int word1 = symbols[value] & 0xFF;
+                stream1bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
+                word1 |= (symbols[value] & 0xFF) << 8;
+                stream1bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
+                word1 |= (symbols[value] & 0xFF) << 16;
+                stream1bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
+                word1 |= (symbols[value] & 0xFF) << 24;
+                stream1bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
+                int word2 = symbols[value] & 0xFF;
+                stream2bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
+                word2 |= (symbols[value] & 0xFF) << 8;
+                stream2bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
+                word2 |= (symbols[value] & 0xFF) << 16;
+                stream2bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
+                word2 |= (symbols[value] & 0xFF) << 24;
+                stream2bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
+                int word3 = symbols[value] & 0xFF;
+                stream3bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
+                word3 |= (symbols[value] & 0xFF) << 8;
+                stream3bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
+                word3 |= (symbols[value] & 0xFF) << 16;
+                stream3bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
+                word3 |= (symbols[value] & 0xFF) << 24;
+                stream3bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
+                int word4 = symbols[value] & 0xFF;
+                stream4bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
+                word4 |= (symbols[value] & 0xFF) << 8;
+                stream4bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
+                word4 |= (symbols[value] & 0xFF) << 16;
+                stream4bitsConsumed += numbersOfBits[value];
+                value = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
+                word4 |= (symbols[value] & 0xFF) << 24;
+                stream4bitsConsumed += numbersOfBits[value];
+            Memory.INT_ARRAY.set(outputArray, (int) output1, word1);
+            Memory.INT_ARRAY.set(outputArray, (int) output2, word2);
+            Memory.INT_ARRAY.set(outputArray, (int) output3, word3);
+            Memory.INT_ARRAY.set(outputArray, (int) output4, word4);
+
+            output1 += SIZE_OF_INT;
+            output2 += SIZE_OF_INT;
+            output3 += SIZE_OF_INT;
+            output4 += SIZE_OF_INT;
+
+            BitInputStream.Loader loader = new BitInputStream.Loader(inputBase, start1, stream1currentAddress, stream1bits, stream1bitsConsumed);
+            boolean done = loader.load();
+            stream1bitsConsumed = loader.getBitsConsumed();
+            stream1bits = loader.getBits();
+            stream1currentAddress = loader.getCurrentAddress();
+            if (done) {
+                break;
+            }
+
+            loader = new BitInputStream.Loader(inputBase, start2, stream2currentAddress, stream2bits, stream2bitsConsumed);
+            done = loader.load();
+            stream2bitsConsumed = loader.getBitsConsumed();
+            stream2bits = loader.getBits();
+            stream2currentAddress = loader.getCurrentAddress();
+            if (done) {
+                break;
+            }
+
+            loader = new BitInputStream.Loader(inputBase, start3, stream3currentAddress, stream3bits, stream3bitsConsumed);
+            done = loader.load();
+            stream3bitsConsumed = loader.getBitsConsumed();
+            stream3bits = loader.getBits();
+            stream3currentAddress = loader.getCurrentAddress();
+            if (done) {
+                break;
+            }
+
+            loader = new BitInputStream.Loader(inputBase, start4, stream4currentAddress, stream4bits, stream4bitsConsumed);
+            done = loader.load();
+            stream4bitsConsumed = loader.getBitsConsumed();
+            stream4bits = loader.getBits();
+            stream4currentAddress = loader.getCurrentAddress();
+            if (done) {
+                break;
+            }
+        }
+
+        while (outputArray == null && output4 < fastOutputLimit) {
             stream1bitsConsumed = decodeSymbol(outputBase, output1, stream1bits, stream1bitsConsumed, tableLog, numbersOfBits, symbols);
             stream2bitsConsumed = decodeSymbol(outputBase, output2, stream2bits, stream2bitsConsumed, tableLog, numbersOfBits, symbols);
             stream3bitsConsumed = decodeSymbol(outputBase, output3, stream3bits, stream3bitsConsumed, tableLog, numbersOfBits, symbols);
@@ -320,7 +418,7 @@ class Huffman
     private static int decodeSymbol(Object outputBase, long outputAddress, long bitContainer, int bitsConsumed, int tableLog, byte[] numbersOfBits, byte[] symbols)
     {
         int value = (int) peekBitsFast(bitsConsumed, bitContainer, tableLog);
-        UNSAFE.putByte(outputBase, outputAddress, symbols[value]);
+        Memory.putByte(outputBase, outputAddress, symbols[value]);
         return bitsConsumed + numbersOfBits[value];
     }
 }

@@ -15,8 +15,7 @@ package io.airlift.compress.zstd;
 
 import java.util.Arrays;
 
-import static io.airlift.compress.zstd.UnsafeUtil.UNSAFE;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.zstd.Memory.ARRAY_BYTE_BASE_OFFSET;
 
 class Histogram
 {
@@ -32,7 +31,7 @@ class Histogram
         Arrays.fill(counts, 0);
 
         for (int i = 0; i < inputSize; i++) {
-            int symbol = UNSAFE.getByte(inputBase, input) & 0xFF;
+            int symbol = Memory.getByte(inputBase, input) & 0xFF;
             input++;
             counts[symbol]++;
         }

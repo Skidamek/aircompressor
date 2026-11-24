@@ -23,7 +23,6 @@ import static io.airlift.compress.zstd.Constants.RAW_BLOCK;
 import static io.airlift.compress.zstd.Constants.RLE_BLOCK;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_BLOCK_HEADER;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_INT;
-import static io.airlift.compress.zstd.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Util.checkArgument;
 import static io.airlift.compress.zstd.Util.checkState;
 import static io.airlift.compress.zstd.Util.fail;
@@ -37,7 +36,7 @@ import static java.lang.Math.max;
 import static java.lang.Math.min;
 import static java.lang.Math.toIntExact;
 import static java.lang.String.format;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.zstd.Memory.ARRAY_BYTE_BASE_OFFSET;
 
 public class ZstdIncrementalFrameDecompressor
 {
@@ -62,6 +61,28 @@ public class ZstdIncrementalFrameDecompressor
 
     private int inputRequired;
     private int requestedOutputSize;
+
+    // ZstdInputStream's input buffer, kept here so a reused decoder also reuses it
+    byte[] streamInputBuffer = new byte[0];
+    // the ZstdInputStream currently using this decoder; a stream whose decoder was taken over refuses to read
+    Object owner;
+
+    /**
+     * Returns this decoder to its initial state, keeping its window buffer, entropy tables and input buffer, so one
+     * instance can decode one stream after another without re-allocating them. Not thread safe.
+     */
+    public void reset()
+    {
+        state = State.INITIAL;
+        frameHeader = null;
+        blockHeader = -1;
+        inputConsumed = 0;
+        outputBufferUsed = 0;
+        inputRequired = 0;
+        requestedOutputSize = 0;
+        partialHash = null;
+        resetFrame();
+    }
 
     // largest window this decoder accepts; its window buffer grows up to about twice this (only as output arrives)
     private final int maxWindowSize;
@@ -111,6 +132,23 @@ public class ZstdIncrementalFrameDecompressor
     }
 
     public void partialDecompress(
+            final Object inputBase,
+            final long inputAddress,
+            final long inputLimit,
+            final byte[] outputArray,
+            final int outputOffset,
+            final int outputLimit)
+    {
+        try {
+            decompressPartial(inputBase, inputAddress, inputLimit, outputArray, outputOffset, outputLimit);
+        }
+        catch (IndexOutOfBoundsException e) {
+            // every access is bounds checked; a corrupt frame that slips past the explicit checks lands here instead of in other memory
+            throw new MalformedInputException(inputAddress, "Input is corrupted", e);
+        }
+    }
+
+    private void decompressPartial(
             final Object inputBase,
             final long inputAddress,
             final long inputLimit,
@@ -182,7 +220,7 @@ public class ZstdIncrementalFrameDecompressor
                 input += frameHeaderSize;
                 state = State.READ_BLOCK_HEADER;
 
-                reset();
+                resetFrame();
                 if (frameHeader.hasChecksum) {
                     partialHash = new XxHash64();
                 }
@@ -198,13 +236,13 @@ public class ZstdIncrementalFrameDecompressor
                     return;
                 }
                 if (inputBufferSize >= SIZE_OF_INT) {
-                    blockHeader = UNSAFE.getInt(inputBase, input) & 0xFF_FFFF;
+                    blockHeader = Memory.getInt(inputBase, input) & 0xFF_FFFF;
                 }
                 else {
-                    blockHeader = UNSAFE.getByte(inputBase, input) & 0xFF |
-                            (UNSAFE.getByte(inputBase, input + 1) & 0xFF) << 8 |
-                            (UNSAFE.getByte(inputBase, input + 2) & 0xFF) << 16;
-                    int expected = UNSAFE.getInt(inputBase, input) & 0xFF_FFFF;
+                    blockHeader = Memory.getByte(inputBase, input) & 0xFF |
+                            (Memory.getByte(inputBase, input + 1) & 0xFF) << 8 |
+                            (Memory.getByte(inputBase, input + 2) & 0xFF) << 16;
+                    int expected = Memory.getInt(inputBase, input) & 0xFF_FFFF;
                     verify(blockHeader == expected, input, "oops");
                 }
                 input += SIZE_OF_BLOCK_HEADER;
@@ -273,7 +311,7 @@ public class ZstdIncrementalFrameDecompressor
                     }
 
                     // read checksum
-                    int checksum = UNSAFE.getInt(inputBase, input);
+                    int checksum = Memory.getInt(inputBase, input);
                     input += SIZE_OF_INT;
 
                     checkState(partialHash != null, "Partial hash not set");
@@ -295,7 +333,7 @@ public class ZstdIncrementalFrameDecompressor
         }
     }
 
-    private void reset()
+    private void resetFrame()
     {
         frameDecompressor.reset();
 
@@ -367,7 +405,7 @@ public class ZstdIncrementalFrameDecompressor
     {
         verify(inputAddress < inputLimit, inputAddress, "Not enough input bytes");
 
-        int frameHeaderDescriptor = UNSAFE.getByte(inputBase, inputAddress) & 0xFF;
+        int frameHeaderDescriptor = Memory.getByte(inputBase, inputAddress) & 0xFF;
         boolean singleSegment = (frameHeaderDescriptor & 0b100000) != 0;
         int dictionaryDescriptor = frameHeaderDescriptor & 0b11;
         int contentSizeDescriptor = frameHeaderDescriptor >>> 6;

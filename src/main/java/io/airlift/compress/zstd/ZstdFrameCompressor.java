@@ -27,10 +27,9 @@ import static io.airlift.compress.zstd.Constants.SIZE_OF_SHORT;
 import static io.airlift.compress.zstd.Constants.TREELESS_LITERALS_BLOCK;
 import static io.airlift.compress.zstd.Huffman.MAX_SYMBOL;
 import static io.airlift.compress.zstd.Huffman.MAX_SYMBOL_COUNT;
-import static io.airlift.compress.zstd.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Util.checkArgument;
 import static io.airlift.compress.zstd.Util.put24BitLittleEndian;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.zstd.Memory.ARRAY_BYTE_BASE_OFFSET;
 
 class ZstdFrameCompressor
 {
@@ -53,7 +52,7 @@ class ZstdFrameCompressor
     {
         checkArgument(outputLimit - outputAddress >= SIZE_OF_INT, "Output buffer too small");
 
-        UNSAFE.putInt(outputBase, outputAddress, MAGIC_NUMBER);
+        Memory.putInt(outputBase, outputAddress, MAGIC_NUMBER);
         return SIZE_OF_INT;
     }
 
@@ -75,7 +74,7 @@ class ZstdFrameCompressor
             frameHeaderDescriptor |= SINGLE_SEGMENT_FLAG;
         }
 
-        UNSAFE.putByte(outputBase, output, (byte) frameHeaderDescriptor);
+        Memory.putByte(outputBase, output, (byte) frameHeaderDescriptor);
         output++;
 
         if (!singleSegment) {
@@ -95,22 +94,22 @@ class ZstdFrameCompressor
             int mantissa = remainder / (base / 8);
             int encoded = ((exponent - MIN_WINDOW_LOG) << 3) | mantissa;
 
-            UNSAFE.putByte(outputBase, output, (byte) encoded);
+            Memory.putByte(outputBase, output, (byte) encoded);
             output++;
         }
 
         switch (contentSizeDescriptor) {
             case 0:
                 if (singleSegment) {
-                    UNSAFE.putByte(outputBase, output++, (byte) inputSize);
+                    Memory.putByte(outputBase, output++, (byte) inputSize);
                 }
                 break;
             case 1:
-                UNSAFE.putShort(outputBase, output, (short) (inputSize - 256));
+                Memory.putShort(outputBase, output, (short) (inputSize - 256));
                 output += SIZE_OF_SHORT;
                 break;
             case 2:
-                UNSAFE.putInt(outputBase, output, inputSize);
+                Memory.putInt(outputBase, output, inputSize);
                 output += SIZE_OF_INT;
                 break;
             default:
@@ -129,7 +128,7 @@ class ZstdFrameCompressor
 
         long hash = XxHash64.hash(0, inputBase, inputAddress, inputSize);
 
-        UNSAFE.putInt(outputBase, outputAddress, (int) hash);
+        Memory.putInt(outputBase, outputAddress, (int) hash);
 
         return SIZE_OF_INT;
     }
@@ -227,7 +226,7 @@ class ZstdFrameCompressor
 
             int blockHeader = (lastBlock ? 1 : 0) | (RAW_BLOCK << 1) | (blockSize << 3);
             put24BitLittleEndian(outputBase, output, blockHeader);
-            UNSAFE.copyMemory(inputBase, input, outputBase, output + SIZE_OF_BLOCK_HEADER, blockSize);
+            Memory.copyMemory(inputBase, input, outputBase, output + SIZE_OF_BLOCK_HEADER, blockSize);
             compressedSize = SIZE_OF_BLOCK_HEADER + blockSize;
         }
         else {
@@ -399,13 +398,13 @@ class ZstdFrameCompressor
             }
             case 4: { // 2 - 2 - 14 - 14
                 int header = encodingType | (2 << 2) | (literalsSize << 4) | (totalSize << 18);
-                UNSAFE.putInt(outputBase, outputAddress, header);
+                Memory.putInt(outputBase, outputAddress, header);
                 break;
             }
             case 5: { // 2 - 2 - 18 - 18
                 int header = encodingType | (3 << 2) | (literalsSize << 4) | (totalSize << 22);
-                UNSAFE.putInt(outputBase, outputAddress, header);
-                UNSAFE.putByte(outputBase, outputAddress + SIZE_OF_INT, (byte) (totalSize >>> 10));
+                Memory.putInt(outputBase, outputAddress, header);
+                Memory.putByte(outputBase, outputAddress + SIZE_OF_INT, (byte) (totalSize >>> 10));
                 break;
             }
             default:  // not possible : headerSize is {3,4,5}
@@ -421,19 +420,19 @@ class ZstdFrameCompressor
 
         switch (headerSize) {
             case 1: // 2 - 1 - 5
-                UNSAFE.putByte(outputBase, outputAddress, (byte) (RLE_LITERALS_BLOCK | (inputSize << 3)));
+                Memory.putByte(outputBase, outputAddress, (byte) (RLE_LITERALS_BLOCK | (inputSize << 3)));
                 break;
             case 2: // 2 - 2 - 12
-                UNSAFE.putShort(outputBase, outputAddress, (short) (RLE_LITERALS_BLOCK | (1 << 2) | (inputSize << 4)));
+                Memory.putShort(outputBase, outputAddress, (short) (RLE_LITERALS_BLOCK | (1 << 2) | (inputSize << 4)));
                 break;
             case 3: // 2 - 2 - 20
-                UNSAFE.putInt(outputBase, outputAddress, RLE_LITERALS_BLOCK | 3 << 2 | inputSize << 4);
+                Memory.putInt(outputBase, outputAddress, RLE_LITERALS_BLOCK | 3 << 2 | inputSize << 4);
                 break;
             default:   // impossible. headerSize is {1,2,3}
                 throw new IllegalStateException();
         }
 
-        UNSAFE.putByte(outputBase, outputAddress + headerSize, UNSAFE.getByte(inputBase, inputAddress));
+        Memory.putByte(outputBase, outputAddress + headerSize, Memory.getByte(inputBase, inputAddress));
 
         return headerSize + 1;
     }
@@ -459,10 +458,10 @@ class ZstdFrameCompressor
 
         switch (headerSize) {
             case 1:
-                UNSAFE.putByte(outputBase, outputAddress, (byte) (RAW_LITERALS_BLOCK | (inputSize << 3)));
+                Memory.putByte(outputBase, outputAddress, (byte) (RAW_LITERALS_BLOCK | (inputSize << 3)));
                 break;
             case 2:
-                UNSAFE.putShort(outputBase, outputAddress, (short) (RAW_LITERALS_BLOCK | (1 << 2) | (inputSize << 4)));
+                Memory.putShort(outputBase, outputAddress, (short) (RAW_LITERALS_BLOCK | (1 << 2) | (inputSize << 4)));
                 break;
             case 3:
                 put24BitLittleEndian(outputBase, outputAddress, RAW_LITERALS_BLOCK | (3 << 2) | (inputSize << 4));
@@ -474,7 +473,7 @@ class ZstdFrameCompressor
         // TODO: ensure this test is correct
         checkArgument(inputSize + 1 <= outputSize, "Output buffer too small");
 
-        UNSAFE.copyMemory(inputBase, inputAddress, outputBase, outputAddress + headerSize, inputSize);
+        Memory.copyMemory(inputBase, inputAddress, outputBase, outputAddress + headerSize, inputSize);
 
         return headerSize + inputSize;
     }

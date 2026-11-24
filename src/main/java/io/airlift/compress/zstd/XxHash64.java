@@ -17,11 +17,10 @@ import java.io.IOException;
 import java.io.InputStream;
 
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
-import static io.airlift.compress.zstd.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Util.checkPositionIndexes;
 import static java.lang.Long.rotateLeft;
 import static java.lang.Math.min;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.zstd.Memory.ARRAY_BYTE_BASE_OFFSET;
 
 // forked from https://github.com/airlift/slice
 final class XxHash64
@@ -105,7 +104,7 @@ final class XxHash64
         if (bufferSize > 0) {
             int available = min(32 - bufferSize, length);
 
-            UNSAFE.copyMemory(base, address, buffer, BUFFER_ADDRESS + bufferSize, available);
+            Memory.copyMemory(base, address, buffer, BUFFER_ADDRESS + bufferSize, available);
 
             bufferSize += available;
             address += available;
@@ -124,7 +123,7 @@ final class XxHash64
         }
 
         if (length > 0) {
-            UNSAFE.copyMemory(base, address, buffer, BUFFER_ADDRESS, length);
+            Memory.copyMemory(base, address, buffer, BUFFER_ADDRESS, length);
             bufferSize = length;
         }
     }
@@ -132,14 +131,37 @@ final class XxHash64
     private int updateBody(Object base, long address, int length)
     {
         int remaining = length;
-        while (remaining >= 32) {
-            v1 = mix(v1, UNSAFE.getLong(base, address));
-            v2 = mix(v2, UNSAFE.getLong(base, address + 8));
-            v3 = mix(v3, UNSAFE.getLong(base, address + 16));
-            v4 = mix(v4, UNSAFE.getLong(base, address + 24));
+        if (base instanceof byte[]) {
+            // int-indexed loop so the JIT can hoist the bounds checks
+            byte[] array = (byte[]) base;
+            int start = Math.toIntExact(address);
+            int end = Math.addExact(start, length & ~31);
+            long a1 = v1;
+            long a2 = v2;
+            long a3 = v3;
+            long a4 = v4;
+            for (int i = start; i < end; i += 32) {
+                a1 = mix(a1, (long) Memory.LONG_ARRAY.get(array, i));
+                a2 = mix(a2, (long) Memory.LONG_ARRAY.get(array, i + 8));
+                a3 = mix(a3, (long) Memory.LONG_ARRAY.get(array, i + 16));
+                a4 = mix(a4, (long) Memory.LONG_ARRAY.get(array, i + 24));
+            }
+            remaining = length & 31;
+            v1 = a1;
+            v2 = a2;
+            v3 = a3;
+            v4 = a4;
+        }
+        else {
+            while (remaining >= 32) {
+                v1 = mix(v1, Memory.getLong(base, address));
+                v2 = mix(v2, Memory.getLong(base, address + 8));
+                v3 = mix(v3, Memory.getLong(base, address + 16));
+                v4 = mix(v4, Memory.getLong(base, address + 24));
 
-            address += 32;
-            remaining -= 32;
+                address += 32;
+                remaining -= 32;
+            }
         }
 
         int index = length - remaining;
@@ -199,17 +221,17 @@ final class XxHash64
     private static long updateTail(long hash, Object base, long address, int index, int length)
     {
         while (index <= length - 8) {
-            hash = updateTail(hash, UNSAFE.getLong(base, address + index));
+            hash = updateTail(hash, Memory.getLong(base, address + index));
             index += 8;
         }
 
         if (index <= length - 4) {
-            hash = updateTail(hash, UNSAFE.getInt(base, address + index));
+            hash = updateTail(hash, Memory.getInt(base, address + index));
             index += 4;
         }
 
         while (index < length) {
-            hash = updateTail(hash, UNSAFE.getByte(base, address + index));
+            hash = updateTail(hash, Memory.getByte(base, address + index));
             index++;
         }
 
@@ -226,14 +248,27 @@ final class XxHash64
         long v4 = seed - PRIME64_1;
 
         int remaining = length;
-        while (remaining >= 32) {
-            v1 = mix(v1, UNSAFE.getLong(base, address));
-            v2 = mix(v2, UNSAFE.getLong(base, address + 8));
-            v3 = mix(v3, UNSAFE.getLong(base, address + 16));
-            v4 = mix(v4, UNSAFE.getLong(base, address + 24));
+        if (base instanceof byte[]) {
+            byte[] array = (byte[]) base;
+            int start = Math.toIntExact(address);
+            int end = Math.addExact(start, length & ~31);
+            for (int i = start; i < end; i += 32) {
+                v1 = mix(v1, (long) Memory.LONG_ARRAY.get(array, i));
+                v2 = mix(v2, (long) Memory.LONG_ARRAY.get(array, i + 8));
+                v3 = mix(v3, (long) Memory.LONG_ARRAY.get(array, i + 16));
+                v4 = mix(v4, (long) Memory.LONG_ARRAY.get(array, i + 24));
+            }
+        }
+        else {
+            while (remaining >= 32) {
+                v1 = mix(v1, Memory.getLong(base, address));
+                v2 = mix(v2, Memory.getLong(base, address + 8));
+                v3 = mix(v3, Memory.getLong(base, address + 16));
+                v4 = mix(v4, Memory.getLong(base, address + 24));
 
-            address += 32;
-            remaining -= 32;
+                address += 32;
+                remaining -= 32;
+            }
         }
 
         long hash = rotateLeft(v1, 1) + rotateLeft(v2, 7) + rotateLeft(v3, 12) + rotateLeft(v4, 18);
