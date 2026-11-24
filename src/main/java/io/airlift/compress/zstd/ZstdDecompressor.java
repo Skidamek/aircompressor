@@ -103,6 +103,88 @@ public class ZstdDecompressor
         }
     }
 
+    /**
+     * Decompresses frames that were compressed against a raw content dictionary (a "prefix"), e.g. by
+     * {@code zstd --patch-from=prefix}: match offsets may reach back past the start of each frame into the
+     * prefix. Frames that carry a non-zero dictionary ID (trained dictionaries) are rejected.
+     */
+    public int decompressWithPrefix(byte[] input, int inputOffset, int inputLength, byte[] output, int outputOffset, int maxOutputLength, byte[] prefix, int prefixOffset, int prefixLength)
+            throws MalformedInputException
+    {
+        verifyRange(input, inputOffset, inputLength);
+        verifyRange(output, outputOffset, maxOutputLength);
+        verifyRange(prefix, prefixOffset, prefixLength);
+        if (inputLength == 0) {
+            // a delta is never empty; stock semantics (zero frames decode to zero bytes) would hide a lost payload
+            throw new MalformedInputException(0, "No zstd frame");
+        }
+
+        long inputAddress = ARRAY_BYTE_BASE_OFFSET + inputOffset;
+        long outputAddress = ARRAY_BYTE_BASE_OFFSET + outputOffset;
+        long prefixAddress = ARRAY_BYTE_BASE_OFFSET + prefixOffset;
+        return decompressor.decompress(
+                input, inputAddress, inputAddress + inputLength,
+                output, outputAddress, outputAddress + maxOutputLength,
+                prefix, prefixAddress, prefixAddress + prefixLength);
+    }
+
+    /**
+     * ByteBuffer variant of {@link #decompressWithPrefix(byte[], int, int, byte[], int, int, byte[], int, int)}. Any buffer may be
+     * direct, including a {@link java.nio.MappedByteBuffer}, so an old file can serve as the prefix and the new file as the output
+     * without copying either onto the heap. The prefix is the region between its position and limit; its position is not changed.
+     */
+    public void decompressWithPrefix(ByteBuffer inputBuffer, ByteBuffer outputBuffer, ByteBuffer prefixBuffer)
+            throws MalformedInputException
+    {
+        Buffer input = inputBuffer;
+        Buffer output = outputBuffer;
+        Buffer prefix = prefixBuffer;
+        Object inputBase = base(input);
+        long inputAddress = address(input) + input.position();
+        long inputLimit = address(input) + input.limit();
+        Object outputBase = base(output);
+        long outputAddress = address(output) + output.position();
+        long outputLimit = address(output) + output.limit();
+        Object prefixBase = base(prefix);
+        long prefixAddress = address(prefix) + prefix.position();
+        long prefixLimit = address(prefix) + prefix.limit();
+        if (inputAddress == inputLimit) {
+            throw new MalformedInputException(0, "No zstd frame");
+        }
+
+        // see decompress(ByteBuffer, ByteBuffer): keep the buffers reachable while their memory is accessed
+        synchronized (input) {
+            synchronized (output) {
+                synchronized (prefix) {
+                    int written = decompressor.decompress(inputBase, inputAddress, inputLimit, outputBase, outputAddress, outputLimit, prefixBase, prefixAddress, prefixLimit);
+                    output.position(output.position() + written);
+                }
+            }
+        }
+    }
+
+    private static Object base(Buffer buffer)
+    {
+        if (buffer.isDirect()) {
+            return null;
+        }
+        if (buffer.hasArray()) {
+            return buffer.array();
+        }
+        throw new IllegalArgumentException("Unsupported ByteBuffer implementation " + buffer.getClass().getName());
+    }
+
+    private static long address(Buffer buffer)
+    {
+        if (buffer.isDirect()) {
+            return getAddress(buffer);
+        }
+        if (buffer.isReadOnly()) {
+            throw new IllegalArgumentException("Read-only heap ByteBuffers are not supported");
+        }
+        return ARRAY_BYTE_BASE_OFFSET + buffer.arrayOffset();
+    }
+
     public static long getDecompressedSize(byte[] input, int offset, int length)
     {
         int baseAddress = ARRAY_BYTE_BASE_OFFSET + offset;

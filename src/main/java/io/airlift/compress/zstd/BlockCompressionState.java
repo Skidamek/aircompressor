@@ -34,6 +34,9 @@ class BlockCompressionState
 
     public void slideWindow(int slideWindowSize)
     {
+        // backport of upstream 3498e2b (v3): keep the window base in step with the slid hash table positions,
+        // otherwise ZstdOutputStream discards still-valid history after every slide and loses ratio
+        windowBaseOffset = Math.max(0, windowBaseOffset - slideWindowSize);
         for (int i = 0; i < hashTable.length; i++) {
             int newValue = hashTable[i] - slideWindowSize;
             // if new value is negative, set it to zero branchless

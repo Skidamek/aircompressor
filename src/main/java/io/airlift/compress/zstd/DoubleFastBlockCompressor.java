@@ -178,6 +178,26 @@ class DoubleFastBlockCompressor
         return (int) (inputEnd - anchor);
     }
 
+    /**
+     * Indexes [start, end) of a prefix (raw content dictionary) so that later blocks can match into it.
+     * Positions are stored relative to the state's base address, which must be at or before {@code start}.
+     */
+    public static void fillHashTables(Object base, long start, long end, BlockCompressionState state, CompressionParameters parameters)
+    {
+        int matchSearchLength = Math.max(parameters.getSearchLength(), 4);
+        int longHashBits = parameters.getHashLog();
+        int shortHashBits = parameters.getChainLog();
+        int[] longHashTable = state.hashTable;
+        int[] shortHashTable = state.chainTable;
+        long baseAddress = state.getBaseAddress();
+        long limit = end - SIZE_OF_LONG;
+        for (long position = start; position <= limit; position++) {
+            int current = (int) (position - baseAddress);
+            longHashTable[hash8(UNSAFE.getLong(base, position), longHashBits)] = current;
+            shortHashTable[hash(base, position, shortHashBits, matchSearchLength)] = current;
+        }
+    }
+
     // TODO: same as LZ4RawCompressor.count
 
     /**

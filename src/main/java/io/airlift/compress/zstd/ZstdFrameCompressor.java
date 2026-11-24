@@ -150,6 +150,40 @@ class ZstdFrameCompressor
         return (int) (output - outputAddress);
     }
 
+    /**
+     * Compresses [inputAddress, inputLimit) against the prefix [prefixAddress, inputAddress) that immediately precedes it in the
+     * same memory. The frame carries no dictionary ID, like {@code zstd --patch-from}; a decoder needs the same prefix.
+     */
+    static int compressWithPrefix(Object base, long prefixAddress, long inputAddress, long inputLimit, Object outputBase, long outputAddress, long outputLimit, CompressionParameters parameters)
+    {
+        int inputSize = (int) (inputLimit - inputAddress);
+        long output = outputAddress;
+        output += writeMagic(outputBase, output, outputLimit);
+        output += writeFrameHeader(outputBase, output, outputLimit, inputSize, parameters.getWindowSize());
+
+        int blockSize = parameters.getBlockSize();
+        int outputSize = (int) (outputLimit - output);
+        int remaining = inputSize;
+        long input = inputAddress;
+        // hash table positions are relative to the prefix start, so matches can reach back into it
+        CompressionContext context = new CompressionContext(parameters, prefixAddress, Math.max(remaining, 1));
+        DoubleFastBlockCompressor.fillHashTables(base, prefixAddress, inputAddress, context.blockCompressionState, parameters);
+        do {
+            checkArgument(outputSize >= SIZE_OF_BLOCK_HEADER + MIN_BLOCK_SIZE, "Output buffer too small");
+            boolean lastBlock = blockSize >= remaining;
+            blockSize = Math.min(blockSize, remaining);
+            int compressedSize = writeCompressedBlock(base, input, blockSize, outputBase, output, outputSize, context, lastBlock);
+            input += blockSize;
+            remaining -= blockSize;
+            output += compressedSize;
+            outputSize -= compressedSize;
+        }
+        while (remaining > 0);
+
+        output += writeChecksum(outputBase, output, outputLimit, base, inputAddress, inputLimit);
+        return (int) (output - outputAddress);
+    }
+
     private static int compressFrame(Object inputBase, long inputAddress, long inputLimit, Object outputBase, long outputAddress, long outputLimit, CompressionParameters parameters)
     {
         int blockSize = parameters.getBlockSize();

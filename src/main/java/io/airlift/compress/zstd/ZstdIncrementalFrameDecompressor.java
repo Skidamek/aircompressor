@@ -63,6 +63,20 @@ public class ZstdIncrementalFrameDecompressor
     private int inputRequired;
     private int requestedOutputSize;
 
+    // largest window this decoder accepts; its window buffer grows up to about twice this (only as output arrives)
+    private final int maxWindowSize;
+
+    public ZstdIncrementalFrameDecompressor()
+    {
+        this(MAX_WINDOW_SIZE);
+    }
+
+    public ZstdIncrementalFrameDecompressor(int maxWindowSize)
+    {
+        checkArgument(maxWindowSize >= MAX_BLOCK_SIZE && maxWindowSize <= (1 << 30), "maxWindowSize must be between 128 KiB and 1 GiB");
+        this.maxWindowSize = maxWindowSize;
+    }
+
     // current window buffer
     private byte[] windowBase = new byte[0];
     private long windowAddress = ARRAY_BYTE_BASE_OFFSET;
@@ -163,6 +177,8 @@ public class ZstdIncrementalFrameDecompressor
                 }
                 frameHeader = readFrameHeader(inputBase, input, inputLimit);
                 verify(frameHeaderSize == frameHeader.headerSize, input, "Unexpected frame header size");
+                // single-segment frames use the content size as the window; it must fit the int-sized window buffer
+                verify(frameHeader.windowSize >= 0 || frameHeader.contentSize <= Integer.MAX_VALUE, input, "Frame content size too large");
                 input += frameHeaderSize;
                 state = State.READ_BLOCK_HEADER;
 
@@ -233,7 +249,7 @@ public class ZstdIncrementalFrameDecompressor
                             return;
                         }
                         verify(windowLimit - windowPosition >= MAX_BLOCK_SIZE, input, "window buffer is too small");
-                        decodedSize = frameDecompressor.decodeCompressedBlock(inputBase, input, blockSize, windowBase, windowPosition, windowLimit, frameHeader.windowSize, windowAddress);
+                        decodedSize = frameDecompressor.decodeCompressedBlock(inputBase, input, blockSize, windowBase, windowPosition, windowLimit, frameHeader.windowSize, maxWindowSize, windowAddress);
                         input += blockSize;
                         break;
                     }
@@ -331,8 +347,10 @@ public class ZstdIncrementalFrameDecompressor
                     newWindowSize = (windowContentsSize + maxBlockOutput) * 2;
                     // limit to 4x the required window size (or block size if larger)
                     newWindowSize = min(newWindowSize, max(requiredWindowSize, MAX_BLOCK_SIZE) * 4);
-                    // limit to the max window size with one max sized block
-                    newWindowSize = min(newWindowSize, MAX_WINDOW_SIZE + MAX_BLOCK_SIZE);
+                    // limit to twice the max window size plus one max sized block. With only window + block (as upstream had it),
+                    // a frame whose window fills the buffer compacts (moves the whole window) before every block: O(window)
+                    // copying per 128 KiB block. With 2x, compaction runs once per window's worth of output (one extra copy per byte).
+                    newWindowSize = min(newWindowSize, 2 * maxWindowSize + MAX_BLOCK_SIZE);
                     // must allocate at least enough space for a max sized block
                     newWindowSize = max(windowContentsSize + maxBlockOutput, newWindowSize);
                     checkState(windowContentsSize + maxBlockOutput <= newWindowSize, "Computed new window size buffer is not large enough");

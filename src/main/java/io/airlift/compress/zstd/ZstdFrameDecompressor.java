@@ -30,6 +30,7 @@ import static io.airlift.compress.zstd.Constants.MATCH_LENGTH_TABLE_LOG;
 import static io.airlift.compress.zstd.Constants.MAX_BLOCK_SIZE;
 import static io.airlift.compress.zstd.Constants.MAX_LITERALS_LENGTH_SYMBOL;
 import static io.airlift.compress.zstd.Constants.MAX_MATCH_LENGTH_SYMBOL;
+import static io.airlift.compress.zstd.Constants.MAX_WINDOW_LOG;
 import static io.airlift.compress.zstd.Constants.MIN_BLOCK_SIZE;
 import static io.airlift.compress.zstd.Constants.MIN_SEQUENCES_SIZE;
 import static io.airlift.compress.zstd.Constants.MIN_WINDOW_LOG;
@@ -132,6 +133,12 @@ class ZstdFrameDecompressor
     private final Huffman huffman = new Huffman();
     private final FseTableReader fse = new FseTableReader();
 
+    // raw content dictionary ("prefix", as used by zstd --patch-from): bytes that logically precede the
+    // first byte of every frame's output, so match offsets may reach back into them
+    private Object dictionaryBase;
+    private long dictionaryAddress;
+    private long dictionaryLimit;
+
     public int decompress(
             final Object inputBase,
             final long inputAddress,
@@ -140,9 +147,47 @@ class ZstdFrameDecompressor
             final long outputAddress,
             final long outputLimit)
     {
+        return decompress(inputBase, inputAddress, inputLimit, outputBase, outputAddress, outputLimit, null, 0, 0);
+    }
+
+    public int decompress(
+            final Object inputBase,
+            final long inputAddress,
+            final long inputLimit,
+            final Object outputBase,
+            final long outputAddress,
+            final long outputLimit,
+            final Object dictionaryBase,
+            final long dictionaryAddress,
+            final long dictionaryLimit)
+    {
         if (outputAddress == outputLimit) {
             return 0;
         }
+        boolean hasDictionary = dictionaryLimit > dictionaryAddress;
+        this.dictionaryBase = dictionaryBase;
+        this.dictionaryAddress = dictionaryAddress;
+        this.dictionaryLimit = hasDictionary ? dictionaryLimit : dictionaryAddress;
+        try {
+            return decompressFrames(inputBase, inputAddress, inputLimit, outputBase, outputAddress, outputLimit, hasDictionary);
+        }
+        finally {
+            // never retain a reference to the caller's dictionary
+            this.dictionaryBase = null;
+            this.dictionaryAddress = 0;
+            this.dictionaryLimit = 0;
+        }
+    }
+
+    private int decompressFrames(
+            final Object inputBase,
+            final long inputAddress,
+            final long inputLimit,
+            final Object outputBase,
+            final long outputAddress,
+            final long outputLimit,
+            final boolean hasDictionary)
+    {
 
         long input = inputAddress;
         long output = outputAddress;
@@ -154,6 +199,9 @@ class ZstdFrameDecompressor
 
             FrameHeader frameHeader = readFrameHeader(inputBase, input, inputLimit);
             input += frameHeader.headerSize;
+            if (frameHeader.contentSize >= 0) {
+                verify(frameHeader.contentSize <= outputLimit - output, input, "Output buffer too small");
+            }
 
             boolean lastBlock;
             do {
@@ -181,7 +229,9 @@ class ZstdFrameDecompressor
                         break;
                     case COMPRESSED_BLOCK:
                         verify(input + blockSize <= inputLimit, input, "Not enough input bytes");
-                        decodedSize = decodeCompressedBlock(inputBase, input, blockSize, outputBase, output, outputLimit, frameHeader.windowSize, outputAddress);
+                        // One-shot decoding keeps all output addressable, so the window size costs no memory here and is not limited.
+                        // With a dictionary, each frame's history starts at its own first byte, preceded by the dictionary.
+                        decodedSize = decodeCompressedBlock(inputBase, input, blockSize, outputBase, output, outputLimit, frameHeader.windowSize, Integer.MAX_VALUE, hasDictionary ? outputStart : outputAddress);
                         input += blockSize;
                         break;
                     default:
@@ -191,6 +241,10 @@ class ZstdFrameDecompressor
                 output += decodedSize;
             }
             while (!lastBlock);
+
+            if (frameHeader.contentSize >= 0) {
+                verify(output - outputStart == frameHeader.contentSize, input, "Decoded size does not match the frame content size");
+            }
 
             if (frameHeader.hasChecksum) {
                 int decodedFrameSize = (int) (output - outputStart);
@@ -271,6 +325,7 @@ class ZstdFrameDecompressor
             long outputAddress,
             long outputLimit,
             int windowSize,
+            int maxWindowSize,
             long outputAbsoluteBaseAddress)
     {
         long inputLimit = inputAddress + blockSize;
@@ -301,7 +356,7 @@ class ZstdFrameDecompressor
                 throw fail(input, "Invalid literals block encoding type");
         }
 
-        verify(windowSize <= MAX_WINDOW_SIZE, input, "Window size too large (not yet supported)");
+        verify(windowSize <= maxWindowSize, input, "Window size too large (not yet supported)");
 
         return decompressSequences(
                 inputBase, input, inputAddress + blockSize,
@@ -494,9 +549,13 @@ class ZstdFrameDecompressor
                 verify(literalEnd <= literalsLimit, input, "Input is corrupted");
 
                 long matchAddress = literalOutputLimit - offset;
-                verify(matchAddress >= outputAbsoluteBaseAddress, input, "Input is corrupted");
-
-                if (literalOutputLimit > fastOutputLimit) {
+                if (matchAddress < outputAbsoluteBaseAddress) {
+                    // the match starts in the dictionary (or is corrupt)
+                    long back = outputAbsoluteBaseAddress - matchAddress;
+                    verify(back <= dictionaryLimit - dictionaryAddress, input, "Input is corrupted");
+                    executeDictionarySequence(outputBase, output, literalOutputLimit, matchOutputLimit, fastOutputLimit, literalsBase, literalsInput, back, offset, outputAbsoluteBaseAddress);
+                }
+                else if (literalOutputLimit > fastOutputLimit) {
                     executeLastSequence(outputBase, output, literalOutputLimit, matchOutputLimit, fastOutputLimit, literalsInput, matchAddress);
                 }
                 else {
@@ -614,7 +673,7 @@ class ZstdFrameDecompressor
                 verify(input < inputLimit, input, "Not enough input bytes");
 
                 byte value = UNSAFE.getByte(inputBase, input++);
-                verify(value <= MAX_MATCH_LENGTH_SYMBOL, input, "Value exceeds expected maximum value");
+                verify((value & 0xFF) <= MAX_MATCH_LENGTH_SYMBOL, input, "Value exceeds expected maximum value");
 
                 FseTableReader.initializeRleTable(matchLengthTable, value);
                 currentMatchLengthTable = matchLengthTable;
@@ -642,7 +701,7 @@ class ZstdFrameDecompressor
                 verify(input < inputLimit, input, "Not enough input bytes");
 
                 byte value = UNSAFE.getByte(inputBase, input++);
-                verify(value <= DEFAULT_MAX_OFFSET_CODE_SYMBOL, input, "Value exceeds expected maximum value");
+                verify((value & 0xFF) <= DEFAULT_MAX_OFFSET_CODE_SYMBOL, input, "Value exceeds expected maximum value");
 
                 FseTableReader.initializeRleTable(offsetCodesTable, value);
                 currentOffsetCodesTable = offsetCodesTable;
@@ -670,7 +729,7 @@ class ZstdFrameDecompressor
                 verify(input < inputLimit, input, "Not enough input bytes");
 
                 byte value = UNSAFE.getByte(inputBase, input++);
-                verify(value <= MAX_LITERALS_LENGTH_SYMBOL, input, "Value exceeds expected maximum value");
+                verify((value & 0xFF) <= MAX_LITERALS_LENGTH_SYMBOL, input, "Value exceeds expected maximum value");
 
                 FseTableReader.initializeRleTable(literalsLengthTable, value);
                 currentLiteralsLengthTable = literalsLengthTable;
@@ -689,6 +748,38 @@ class ZstdFrameDecompressor
                 throw fail(input, "Invalid literals length encoding type");
         }
         return input;
+    }
+
+    private void executeDictionarySequence(Object outputBase, long output, long literalOutputLimit, long matchOutputLimit, long fastOutputLimit, Object literalsBase, long literalInput, long back, int offset, long outputAbsoluteBaseAddress)
+    {
+        // literals: wild copy only while it cannot run past the safe limit
+        if (literalOutputLimit <= fastOutputLimit) {
+            output = copyLiterals(outputBase, literalsBase, output, literalInput, literalOutputLimit);
+        }
+        else {
+            UNSAFE.copyMemory(literalsBase, literalInput, outputBase, output, literalOutputLimit - output);
+            output = literalOutputLimit;
+        }
+
+        // part of the match that lies in the dictionary: a different buffer, so it can never overlap the output
+        long matchLength = matchOutputLimit - output;
+        long fromDictionary = Math.min(back, matchLength);
+        UNSAFE.copyMemory(dictionaryBase, dictionaryLimit - back, outputBase, output, fromDictionary);
+        output += fromDictionary;
+
+        // the rest continues at the start of this frame's output, `offset` bytes behind
+        long remaining = matchOutputLimit - output;
+        if (remaining > 0) {
+            long source = outputAbsoluteBaseAddress;
+            if (offset >= remaining) {
+                UNSAFE.copyMemory(outputBase, source, outputBase, output, remaining);
+            }
+            else {
+                while (output < matchOutputLimit) {
+                    UNSAFE.putByte(outputBase, output++, UNSAFE.getByte(outputBase, source++));
+                }
+            }
+        }
     }
 
     private void executeLastSequence(Object outputBase, long output, long literalOutputLimit, long matchOutputLimit, long fastOutputLimit, long literalInput, long matchAddress)
@@ -901,8 +992,10 @@ class ZstdFrameDecompressor
             int exponent = windowDescriptor >>> 3;
             int mantissa = windowDescriptor & 0b111;
 
-            int base = 1 << (MIN_WINDOW_LOG + exponent);
-            windowSize = base + (base / 8) * mantissa;
+            long base = 1L << (MIN_WINDOW_LOG + exponent);
+            long size = base + (base / 8) * mantissa;
+            verify(MIN_WINDOW_LOG + exponent <= MAX_WINDOW_LOG, input, "Window size too large");
+            windowSize = (int) Math.min(size, Integer.MAX_VALUE);
         }
 
         // decode dictionary id
@@ -921,7 +1014,8 @@ class ZstdFrameDecompressor
                 input += SIZE_OF_INT;
                 break;
         }
-        verify(dictionaryId == -1, input, "Custom dictionaries not supported");
+        // ID 0 is the same as "no dictionary ID" (raw content dictionaries and prefixes carry none)
+        verify(dictionaryId == -1 || dictionaryId == 0, input, "Custom dictionaries not supported");
 
         // decode content size
         long contentSize = -1;
@@ -944,6 +1038,7 @@ class ZstdFrameDecompressor
             case 3:
                 contentSize = UNSAFE.getLong(inputBase, input);
                 input += SIZE_OF_LONG;
+                verify(contentSize >= 0, input, "Frame content size too large");
                 break;
         }
 

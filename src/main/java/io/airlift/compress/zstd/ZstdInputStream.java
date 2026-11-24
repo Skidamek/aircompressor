@@ -29,9 +29,9 @@ public class ZstdInputStream
     private static final int MIN_BUFFER_SIZE = 4096;
 
     private final InputStream inputStream;
-    private final ZstdIncrementalFrameDecompressor decompressor = new ZstdIncrementalFrameDecompressor();
+    private final ZstdIncrementalFrameDecompressor decompressor;
 
-    private byte[] inputBuffer = new byte[decompressor.getInputRequired()];
+    private byte[] inputBuffer;
     private int inputBufferOffset;
     private int inputBufferLimit;
 
@@ -41,6 +41,17 @@ public class ZstdInputStream
 
     public ZstdInputStream(InputStream inputStream)
     {
+        this(inputStream, ZstdFrameDecompressor.MAX_WINDOW_SIZE);
+    }
+
+    /**
+     * @param maxWindowSize largest frame window accepted (default 8 MiB). Frames above it fail with
+     *        MalformedInputException; memory use is bounded by about twice this value.
+     */
+    public ZstdInputStream(InputStream inputStream, int maxWindowSize)
+    {
+        this.decompressor = new ZstdIncrementalFrameDecompressor(maxWindowSize);
+        this.inputBuffer = new byte[decompressor.getInputRequired()];
         this.inputStream = requireNonNull(inputStream, "inputStream is null");
     }
 

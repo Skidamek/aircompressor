@@ -51,6 +51,42 @@ public class ZstdCompressor
         return ZstdFrameCompressor.compress(input, inputAddress, inputAddress + inputLength, output, outputAddress, outputAddress + maxOutputLength, CompressionParameters.DEFAULT_COMPRESSION_LEVEL);
     }
 
+    /** Largest prefix + input this encoder accepts: offsets must stay within the 28-bit offset codes every decoder's default tables cover. */
+    public static final int MAX_PREFIX_WINDOW = 1 << 28;
+
+    /**
+     * Compresses {@code input} against {@code prefix} (a raw content dictionary), producing a frame equivalent to
+     * {@code zstd --patch-from=prefix}. Any zstd decoder that is given the same prefix can decode it, including
+     * the reference library ({@code ZSTD_DCtx_refPrefix}) and CLI ({@code zstd -d --patch-from=prefix}).
+     *
+     * @param hashLog log2 of the match-finder tables (two int tables of 2^hashLog and 2^(hashLog-1) entries);
+     *        0 picks one from the prefix and input sizes
+     */
+    public int compressWithPrefix(byte[] input, int inputOffset, int inputLength, byte[] output, int outputOffset, int maxOutputLength, byte[] prefix, int prefixOffset, int prefixLength, int hashLog)
+    {
+        verifyRange(input, inputOffset, inputLength);
+        verifyRange(output, outputOffset, maxOutputLength);
+        verifyRange(prefix, prefixOffset, prefixLength);
+        long total = (long) prefixLength + inputLength;
+        if (total > MAX_PREFIX_WINDOW) {
+            throw new IllegalArgumentException("prefix + input exceed " + MAX_PREFIX_WINDOW + " bytes");
+        }
+        // the match finder needs prefix and input in one address range
+        byte[] joined = new byte[(int) total];
+        System.arraycopy(prefix, prefixOffset, joined, 0, prefixLength);
+        System.arraycopy(input, inputOffset, joined, prefixLength, inputLength);
+
+        int windowLog = Math.max(Constants.MIN_WINDOW_LOG, 64 - Long.numberOfLeadingZeros(total - 1));
+        if (hashLog <= 0) {
+            hashLog = Math.max(17, Math.min(22, windowLog + 1));
+        }
+        CompressionParameters parameters = new CompressionParameters(windowLog, hashLog - 1, hashLog, 1, 5, 1, CompressionParameters.Strategy.DFAST);
+
+        long base = ARRAY_BYTE_BASE_OFFSET;
+        long outputAddress = ARRAY_BYTE_BASE_OFFSET + outputOffset;
+        return ZstdFrameCompressor.compressWithPrefix(joined, base, base + prefixLength, base + total, output, outputAddress, outputAddress + maxOutputLength, parameters);
+    }
+
     @Override
     public void compress(ByteBuffer inputBuffer, ByteBuffer outputBuffer)
     {

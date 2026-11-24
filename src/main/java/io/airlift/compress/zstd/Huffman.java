@@ -82,6 +82,7 @@ class Huffman
 
         int totalWeight = 0;
         for (int i = 0; i < outputSize; i++) {
+            verify(weights[i] <= MAX_TABLE_LOG, input, "Input is corrupted");
             ranks[weights[i]]++;
             totalWeight += (1 << weights[i]) >> 1;   // TODO same as 1 << (weights[n] - 1)?
         }
