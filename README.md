@@ -1,26 +1,44 @@
-# Compression in pure Java
-[![Maven Central](https://img.shields.io/maven-central/v/io.airlift/aircompressor.svg?label=Maven%20Central)](https://search.maven.org/#search%7Cga%7C1%7Cg%3A%22io.airlift%22%20AND%20a%3A%22aircompressor%22)
+# aircompressor (zstd-only fork)
 
-This library contains implementations of
-[Zstandard](https://www.zstd.net/) (Zstd),
-[LZ4](https://www.lz4.org/),
-[Snappy](https://google.github.io/snappy/), and
-[LZO](https://www.oberhumer.com/opensource/lzo/) written in pure Java. They are 
-typically 10-40% faster than the JNI wrapper for the native libraries.  
-Additionally implementations of GZIP and Deflate using the Java built-in library, 
-and pure Java BZip2 implementations are provided for ease of integrations with
-systems that need these algorithms. 
+Pure-Java 17, `sun.misc.Unsafe`-free, zstd-only fork of [airlift/aircompressor](https://github.com/airlift/aircompressor) `2.0.3` with raw-content prefix (`zstd --patch-from`) support and reusable streaming decoders.
 
-# Hadoop CompressionCodec
+- **Zero runtime dependencies** (`jdeps`: `java.base` only)
+- **No `sun.misc.Unsafe`** — runs cleanly on Java 17–25+ and under `--sun-misc-unsafe-memory-access=deny` without `--add-opens`
+- **Raw-content prefix (`--patch-from`)** compression and decompression on `byte[]`, heap `ByteBuffer`, direct `ByteBuffer`, and `MappedByteBuffer`
+- **Reusable streaming decoder** (`ZstdInputStream(InputStream, ZstdIncrementalFrameDecompressor)`) with configurable `maxWindowSize` and observable `retainedWindowBytes()`
 
-In addition to the raw block encoders, there are implementations of the
-Hadoop CompressionCodec (Streaming) for each algorithm. They are
-typically 300% faster than the JNI wrappers.
+See [UPSTREAM.md](UPSTREAM.md) for the exact diff and upstream backports.
 
-# Requirements
+## Gradle
 
-This library requires a Java 1.8+ virtual machine containing the `sun.misc.Unsafe` interface running on a little endian platform.
+```kotlin
+repositories {
+    maven("https://skidamek.github.io/maven/")
+}
 
-# Users
+dependencies {
+    implementation("pl.skidam:aircompressor:2.0.3-1")
+}
+```
 
-This library is used in projects such as Trino (https://trino.io), a distributed SQL engine.
+## Public API
+
+Package `io.airlift.compress` / `io.airlift.compress.zstd`:
+
+- **`ZstdDecompressor`**: `decompress(...)`, `decompressWithPrefix(...)` (`byte[]` and `ByteBuffer`), `getDecompressedSize(...)`
+- **`ZstdCompressor`**: `compress(...)`, `compressWithPrefix(...)`, `maxCompressedLength(...)`
+- **`ZstdInputStream`**: `ZstdInputStream(in)`, `ZstdInputStream(in, maxWindowSize)`, `ZstdInputStream(in, ZstdIncrementalFrameDecompressor)`
+- **`ZstdIncrementalFrameDecompressor`**: `reset()`, `retainedWindowBytes()`, `partialDecompress(...)`
+- **`ZstdOutputStream`**: streaming zstd encoder
+
+## Building
+
+Requires Java 17+:
+
+```sh
+./gradlew build
+```
+
+## License
+
+Apache License 2.0. See [license.txt](license.txt), [notice.md](notice.md), and [UPSTREAM.md](UPSTREAM.md).
