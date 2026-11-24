@@ -17,7 +17,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
 
-import static io.airlift.compress.zstd.Util.checkPositionIndexes;
 import static io.airlift.compress.zstd.Util.checkState;
 import static java.lang.Math.max;
 import static java.util.Objects.requireNonNull;
@@ -96,7 +95,9 @@ public class ZstdInputStream
         if (outputBuffer == null) {
             throw new NullPointerException();
         }
-        checkPositionIndexes(outputOffset, outputOffset + outputLength, outputBuffer.length);
+        if (outputOffset < 0 || outputLength < 0 || outputOffset > outputBuffer.length - outputLength) {
+            throw new IndexOutOfBoundsException("Invalid offset or length (" + outputOffset + ", " + outputLength + ") in array of length " + outputBuffer.length);
+        }
         if (outputLength == 0) {
             return 0;
         }
@@ -160,7 +161,7 @@ public class ZstdInputStream
     public int available()
             throws IOException
     {
-        if (closed) {
+        if (closed || decompressor.owner != this) {
             return 0;
         }
         return decompressor.getRequestedOutputSize();
@@ -172,6 +173,9 @@ public class ZstdInputStream
     {
         if (!closed) {
             closed = true;
+            if (decompressor.owner == this) {
+                decompressor.owner = null;
+            }
             inputStream.close();
         }
     }

@@ -88,6 +88,10 @@ public class ZstdOutputStream
         if (closed) {
             throw new IOException("Stream is closed");
         }
+        requireNonNull(buffer, "buffer is null");
+        if (offset < 0 || length < 0 || offset > buffer.length - length) {
+            throw new IndexOutOfBoundsException("Invalid offset or length (" + offset + ", " + length + ") in array of length " + buffer.length);
+        }
 
         growBufferIfNecessary(length);
 
@@ -105,17 +109,17 @@ public class ZstdOutputStream
 
     private void growBufferIfNecessary(int length)
     {
-        if (uncompressedPosition + length <= uncompressed.length || uncompressed.length >= maxBufferSize) {
+        if ((long) uncompressedPosition + length <= uncompressed.length || uncompressed.length >= maxBufferSize) {
             return;
         }
 
         // assume we will need double the current required space
-        int newSize = (uncompressed.length + length) * 2;
+        long newSize = ((long) uncompressed.length + length) * 2;
         // limit to max buffer size
         newSize = min(newSize, maxBufferSize);
         // allocate at least a minimal buffer to start;
         newSize = max(newSize, context.parameters.getBlockSize());
-        uncompressed = Arrays.copyOf(uncompressed, newSize);
+        uncompressed = Arrays.copyOf(uncompressed, (int) newSize);
     }
 
     private void compressIfNecessary()

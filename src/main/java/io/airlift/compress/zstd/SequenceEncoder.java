@@ -159,7 +159,7 @@ class SequenceEncoder
                         workspace.offsetCodeTable,
                         outputBase,
                         output,
-                        output + outputSize,
+                        outputLimit,
                         sequenceCount,
                         OFFSET_TABLE_LOG,
                         sequences.offsetCodes,

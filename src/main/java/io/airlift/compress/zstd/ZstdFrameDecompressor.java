@@ -31,7 +31,7 @@ import static io.airlift.compress.zstd.Constants.MAX_BLOCK_SIZE;
 import static io.airlift.compress.zstd.Constants.MAX_LITERALS_LENGTH_SYMBOL;
 import static io.airlift.compress.zstd.Constants.MAX_MATCH_LENGTH_SYMBOL;
 import static io.airlift.compress.zstd.Constants.MAX_WINDOW_LOG;
-import static io.airlift.compress.zstd.Constants.MIN_BLOCK_SIZE;
+import static io.airlift.compress.zstd.Constants.MIN_COMPRESSED_BLOCK_SIZE;
 import static io.airlift.compress.zstd.Constants.MIN_SEQUENCES_SIZE;
 import static io.airlift.compress.zstd.Constants.MIN_WINDOW_LOG;
 import static io.airlift.compress.zstd.Constants.OFFSET_TABLE_LOG;
@@ -62,6 +62,9 @@ class ZstdFrameDecompressor
     private static final int[] DEC_64_TABLE = {0, 0, 0, -1, 0, 1, 2, 3};
 
     private static final int V07_MAGIC_NUMBER = 0xFD2FB527;
+    static final int SKIPPABLE_MAGIC_NUMBER = 0x184D2A50;
+    static final int SKIPPABLE_MAGIC_NUMBER_MASK = 0xFFFF_FFF0;
+    static final int SKIPPABLE_FRAME_HEADER_SIZE = 8;
 
     static final int MAX_WINDOW_SIZE = 1 << 23;
 
@@ -160,15 +163,12 @@ class ZstdFrameDecompressor
             final long dictionaryAddress,
             final long dictionaryLimit)
     {
-        if (outputAddress == outputLimit) {
-            return 0;
-        }
         boolean hasDictionary = dictionaryLimit > dictionaryAddress;
         this.dictionaryBase = dictionaryBase;
         this.dictionaryAddress = dictionaryAddress;
         this.dictionaryLimit = hasDictionary ? dictionaryLimit : dictionaryAddress;
         try {
-            return decompressFrames(inputBase, inputAddress, inputLimit, outputBase, outputAddress, outputLimit, hasDictionary);
+            return decompressFrames(inputBase, inputAddress, inputLimit, outputBase, outputAddress, outputLimit);
         }
         catch (IndexOutOfBoundsException e) {
             // every access is bounds checked; a corrupt frame that slips past the explicit checks lands here instead of in other memory
@@ -188,14 +188,18 @@ class ZstdFrameDecompressor
             final long inputLimit,
             final Object outputBase,
             final long outputAddress,
-            final long outputLimit,
-            final boolean hasDictionary)
+            final long outputLimit)
     {
-
         long input = inputAddress;
         long output = outputAddress;
 
         while (input < inputLimit) {
+            long skippableFrameSize = getSkippableFrameSize(inputBase, input, inputLimit);
+            if (skippableFrameSize > 0) {
+                input += skippableFrameSize;
+                continue;
+            }
+
             reset();
             long outputStart = output;
             input += verifyMagic(inputBase, input, inputLimit);
@@ -233,8 +237,8 @@ class ZstdFrameDecompressor
                     case COMPRESSED_BLOCK:
                         verify(input + blockSize <= inputLimit, input, "Not enough input bytes");
                         // One-shot decoding keeps all output addressable, so the window size costs no memory here and is not limited.
-                        // With a dictionary, each frame's history starts at its own first byte, preceded by the dictionary.
-                        decodedSize = decodeCompressedBlock(inputBase, input, blockSize, outputBase, output, outputLimit, frameHeader.windowSize, Integer.MAX_VALUE, hasDictionary ? outputStart : outputAddress);
+                        // Each frame's history starts at its own first byte (preceded by the dictionary, if any).
+                        decodedSize = decodeCompressedBlock(inputBase, input, blockSize, outputBase, output, outputLimit, frameHeader.windowSize, Integer.MAX_VALUE, outputStart);
                         input += blockSize;
                         break;
                     default:
@@ -335,7 +339,7 @@ class ZstdFrameDecompressor
         long input = inputAddress;
 
         verify(blockSize <= MAX_BLOCK_SIZE, input, "Expected match length table to be present");
-        verify(blockSize >= MIN_BLOCK_SIZE, input, "Compressed block size too small");
+        verify(blockSize >= MIN_COMPRESSED_BLOCK_SIZE, input, "Compressed block size too small");
 
         // decode literals
         int literalsBlockType = Memory.getByte(inputBase, input) & 0b11;
@@ -587,22 +591,6 @@ class ZstdFrameDecompressor
         Memory.copyMemory(literalsBase, literalsInput, outputBase, output, lastLiteralsSize);
         output += lastLiteralsSize;
         return output;
-    }
-
-    private static void copyMatch(Object outputBase,
-            long fastOutputLimit,
-            long output,
-            int offset,
-            long matchOutputLimit,
-            long matchAddress,
-            int matchLength,
-            long fastMatchOutputLimit)
-    {
-        matchAddress = copyMatchHead(outputBase, output, offset, matchAddress);
-        output += SIZE_OF_LONG;
-        matchLength -= SIZE_OF_LONG; // first 8 bytes copied above
-
-        copyMatchTail(outputBase, fastOutputLimit, output, matchOutputLimit, matchAddress, matchLength, fastMatchOutputLimit);
     }
 
     private static void copyMatchTail(Object outputBase, long fastOutputLimit, long output, long matchOutputLimit, long matchAddress, int matchLength, long fastMatchOutputLimit)
@@ -898,6 +886,8 @@ class ZstdFrameDecompressor
                 input++;
                 break;
             case 1:
+                // we need at least 3 bytes (2 for the header, 1 for the payload)
+                verify(blockSize >= 3, input, "Not enough input bytes");
                 outputSize = (Memory.getShort(inputBase, input) & 0xFFFF) >>> 4;
                 input += 2;
                 break;
@@ -940,6 +930,8 @@ class ZstdFrameDecompressor
                 input += 2;
                 break;
             case 3:
+                // we need at least 3 bytes for the header
+                verify(inputLimit - input >= 3, input, "Not enough input bytes");
                 // read 3 little-endian bytes
                 int header = ((Memory.getByte(inputBase, input) & 0xFF) |
                         ((Memory.getShort(inputBase, input + 1) & 0xFFFF) << 8));
@@ -1062,6 +1054,20 @@ class ZstdFrameDecompressor
         long input = inputAddress;
         input += verifyMagic(inputBase, input, inputLimit);
         return readFrameHeader(inputBase, input, inputLimit).contentSize;
+    }
+
+    // returns the size of the skippable frame at the input, including its header, or 0 when the input starts with another kind of frame
+    static long getSkippableFrameSize(Object inputBase, long inputAddress, long inputLimit)
+    {
+        verify(inputLimit - inputAddress >= SIZE_OF_INT, inputAddress, "Not enough input bytes");
+        if ((Memory.getInt(inputBase, inputAddress) & SKIPPABLE_MAGIC_NUMBER_MASK) != SKIPPABLE_MAGIC_NUMBER) {
+            return 0;
+        }
+
+        verify(inputLimit - inputAddress >= SKIPPABLE_FRAME_HEADER_SIZE, inputAddress, "Not enough input bytes");
+        long frameSize = SKIPPABLE_FRAME_HEADER_SIZE + (Memory.getInt(inputBase, inputAddress + SIZE_OF_INT) & 0xFFFF_FFFFL);
+        verify(frameSize <= inputLimit - inputAddress, inputAddress, "Not enough input bytes");
+        return frameSize;
     }
 
     static int verifyMagic(Object inputBase, long inputAddress, long inputLimit)

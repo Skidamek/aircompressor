@@ -74,9 +74,14 @@ public class ZstdCompressor
         System.arraycopy(prefix, prefixOffset, joined, 0, prefixLength);
         System.arraycopy(input, inputOffset, joined, prefixLength, inputLength);
 
-        int windowLog = Math.max(Constants.MIN_WINDOW_LOG, 64 - Long.numberOfLeadingZeros(total - 1));
+        int windowLog = total <= 1
+                ? Constants.MIN_WINDOW_LOG
+                : Math.max(Constants.MIN_WINDOW_LOG, 64 - Long.numberOfLeadingZeros(total - 1));
         if (hashLog <= 0) {
             hashLog = Math.max(17, Math.min(22, windowLog + 1));
+        }
+        else if (hashLog < 7 || hashLog > 26) {
+            throw new IllegalArgumentException("hashLog must be between 7 and 26 (or <= 0 for automatic): " + hashLog);
         }
         CompressionParameters parameters = new CompressionParameters(windowLog, hashLog - 1, hashLog, 1, 5, 1, CompressionParameters.Strategy.DFAST);
 
@@ -110,7 +115,7 @@ public class ZstdCompressor
     private static void verifyRange(byte[] data, int offset, int length)
     {
         requireNonNull(data, "data is null");
-        if (offset < 0 || length < 0 || offset + length > data.length) {
+        if (offset < 0 || length < 0 || offset > data.length - length) {
             throw new IllegalArgumentException(format("Invalid offset or length (%s, %s) in array of length %s", offset, length, data.length));
         }
     }

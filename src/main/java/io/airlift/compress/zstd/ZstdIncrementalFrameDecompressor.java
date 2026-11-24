@@ -28,6 +28,9 @@ import static io.airlift.compress.zstd.Util.checkState;
 import static io.airlift.compress.zstd.Util.fail;
 import static io.airlift.compress.zstd.Util.verify;
 import static io.airlift.compress.zstd.ZstdFrameDecompressor.MAX_WINDOW_SIZE;
+import static io.airlift.compress.zstd.ZstdFrameDecompressor.SKIPPABLE_FRAME_HEADER_SIZE;
+import static io.airlift.compress.zstd.ZstdFrameDecompressor.SKIPPABLE_MAGIC_NUMBER;
+import static io.airlift.compress.zstd.ZstdFrameDecompressor.SKIPPABLE_MAGIC_NUMBER_MASK;
 import static io.airlift.compress.zstd.ZstdFrameDecompressor.decodeRawBlock;
 import static io.airlift.compress.zstd.ZstdFrameDecompressor.decodeRleBlock;
 import static io.airlift.compress.zstd.ZstdFrameDecompressor.readFrameHeader;
@@ -40,9 +43,12 @@ import static io.airlift.compress.zstd.Memory.ARRAY_BYTE_BASE_OFFSET;
 
 public class ZstdIncrementalFrameDecompressor
 {
+    private static final int MAX_ARRAY_SIZE = Integer.MAX_VALUE - 8;
+
     private enum State {
         INITIAL,
         READ_FRAME_MAGIC,
+        SKIP_FRAME,
         READ_FRAME_HEADER,
         READ_BLOCK_HEADER,
         READ_BLOCK,
@@ -55,6 +61,8 @@ public class ZstdIncrementalFrameDecompressor
     private State state = State.INITIAL;
     private FrameHeader frameHeader;
     private int blockHeader = -1;
+    private long decodedFrameSize;
+    private long skippableBytesRemaining;
 
     private int inputConsumed;
     private int outputBufferUsed;
@@ -76,6 +84,8 @@ public class ZstdIncrementalFrameDecompressor
         state = State.INITIAL;
         frameHeader = null;
         blockHeader = -1;
+        decodedFrameSize = 0;
+        skippableBytesRemaining = 0;
         inputConsumed = 0;
         outputBufferUsed = 0;
         inputRequired = 0;
@@ -129,6 +139,16 @@ public class ZstdIncrementalFrameDecompressor
     public int getRequestedOutputSize()
     {
         return requestedOutputSize;
+    }
+
+    /**
+     * Bytes of window buffer this decoder holds right now. The buffer is sized from the frame header's window (up to
+     * {@code maxWindowSize}), not from the output it produced, so a pool that reuses decoders between streams must charge
+     * each one for this instead of for the bytes it decoded.
+     */
+    public int retainedWindowBytes()
+    {
+        return windowBase.length;
     }
 
     public void partialDecompress(
@@ -195,12 +215,38 @@ public class ZstdIncrementalFrameDecompressor
             checkState(computeFlushableOutputSize(frameHeader) == 0, "Expected output to be flushed");
 
             if (state == State.READ_FRAME_MAGIC || state == State.INITIAL) {
-                if (inputLimit - input < 4) {
-                    inputRequired(inputAddress, outputOffset, input, output, 4);
+                if (inputLimit - input < SIZE_OF_INT) {
+                    inputRequired(inputAddress, outputOffset, input, output, SIZE_OF_INT);
                     return;
+                }
+                int magic = Memory.getInt(inputBase, input);
+                if ((magic & SKIPPABLE_MAGIC_NUMBER_MASK) == SKIPPABLE_MAGIC_NUMBER) {
+                    if (inputLimit - input < SKIPPABLE_FRAME_HEADER_SIZE) {
+                        inputRequired(inputAddress, outputOffset, input, output, SKIPPABLE_FRAME_HEADER_SIZE);
+                        return;
+                    }
+                    skippableBytesRemaining = Memory.getInt(inputBase, input + SIZE_OF_INT) & 0xFFFF_FFFFL;
+                    input += SKIPPABLE_FRAME_HEADER_SIZE;
+                    state = skippableBytesRemaining > 0 ? State.SKIP_FRAME : State.READ_FRAME_MAGIC;
+                    continue;
                 }
                 input += verifyMagic(inputBase, input, inputLimit);
                 state = State.READ_FRAME_HEADER;
+            }
+
+            if (state == State.SKIP_FRAME) {
+                long available = inputLimit - input;
+                if (available > 0) {
+                    long skip = min(available, skippableBytesRemaining);
+                    input += skip;
+                    skippableBytesRemaining -= skip;
+                }
+                if (skippableBytesRemaining > 0) {
+                    inputRequired(inputAddress, outputOffset, input, output, 1);
+                    return;
+                }
+                state = State.READ_FRAME_MAGIC;
+                continue;
             }
 
             if (state == State.READ_FRAME_HEADER) {
@@ -215,8 +261,9 @@ public class ZstdIncrementalFrameDecompressor
                 }
                 frameHeader = readFrameHeader(inputBase, input, inputLimit);
                 verify(frameHeaderSize == frameHeader.headerSize, input, "Unexpected frame header size");
-                // single-segment frames use the content size as the window; it must fit the int-sized window buffer
-                verify(frameHeader.windowSize >= 0 || frameHeader.contentSize <= Integer.MAX_VALUE, input, "Frame content size too large");
+                // single-segment frames use the content size as the window; enforce maxWindowSize for both regular and single-segment frames
+                verify(frameHeader.windowSize <= maxWindowSize, input, "Window size too large (not yet supported)");
+                verify(frameHeader.windowSize >= 0 || frameHeader.contentSize <= maxWindowSize, input, "Window size too large (not yet supported)");
                 input += frameHeaderSize;
                 state = State.READ_BLOCK_HEADER;
 
@@ -239,11 +286,10 @@ public class ZstdIncrementalFrameDecompressor
                     blockHeader = Memory.getInt(inputBase, input) & 0xFF_FFFF;
                 }
                 else {
+                    // exactly 3 bytes left: stock re-read them as an int here (a debug check), one byte past the input
                     blockHeader = Memory.getByte(inputBase, input) & 0xFF |
                             (Memory.getByte(inputBase, input + 1) & 0xFF) << 8 |
                             (Memory.getByte(inputBase, input + 2) & 0xFF) << 16;
-                    int expected = Memory.getInt(inputBase, input) & 0xFF_FFFF;
-                    verify(blockHeader == expected, input, "oops");
                 }
                 input += SIZE_OF_BLOCK_HEADER;
                 state = State.READ_BLOCK;
@@ -295,7 +341,14 @@ public class ZstdIncrementalFrameDecompressor
                         throw fail(input, "Invalid block type");
                 }
                 windowPosition += decodedSize;
+                decodedFrameSize += decodedSize;
+                if (frameHeader.contentSize >= 0) {
+                    verify(decodedFrameSize <= frameHeader.contentSize, input, "Decoded size exceeds the frame content size");
+                }
                 if (lastBlock) {
+                    if (frameHeader.contentSize >= 0) {
+                        verify(decodedFrameSize == frameHeader.contentSize, input, "Decoded size does not match the frame content size");
+                    }
                     state = State.READ_BLOCK_CHECKSUM;
                 }
                 else {
@@ -337,6 +390,7 @@ public class ZstdIncrementalFrameDecompressor
     {
         frameDecompressor.reset();
 
+        decodedFrameSize = 0;
         windowAddress = ARRAY_BYTE_BASE_OFFSET;
         windowPosition = ARRAY_BYTE_BASE_OFFSET;
     }
@@ -375,24 +429,21 @@ public class ZstdIncrementalFrameDecompressor
 
             // if window free space is still too small, grow array
             if (windowLimit - windowPosition < maxBlockOutput) {
-                // if content size is set and smaller than the required window size, use the content size
-                int newWindowSize;
-                if (frameHeader.contentSize >= 0 && frameHeader.contentSize < requiredWindowSize) {
-                    newWindowSize = toIntExact(frameHeader.contentSize);
-                }
-                else {
-                    // double the current necessary window size
-                    newWindowSize = (windowContentsSize + maxBlockOutput) * 2;
-                    // limit to 4x the required window size (or block size if larger)
-                    newWindowSize = min(newWindowSize, max(requiredWindowSize, MAX_BLOCK_SIZE) * 4);
-                    // limit to twice the max window size plus one max sized block. With only window + block (as upstream had it),
-                    // a frame whose window fills the buffer compacts (moves the whole window) before every block: O(window)
-                    // copying per 128 KiB block. With 2x, compaction runs once per window's worth of output (one extra copy per byte).
-                    newWindowSize = min(newWindowSize, 2 * maxWindowSize + MAX_BLOCK_SIZE);
-                    // must allocate at least enough space for a max sized block
-                    newWindowSize = max(windowContentsSize + maxBlockOutput, newWindowSize);
-                    checkState(windowContentsSize + maxBlockOutput <= newWindowSize, "Computed new window size buffer is not large enough");
-                }
+                long needed = (long) windowContentsSize + maxBlockOutput;
+                // double the current necessary window size
+                long newSize = needed * 2;
+                // limit to 4x the required window size (or block size if larger)
+                newSize = min(newSize, (long) max(requiredWindowSize, MAX_BLOCK_SIZE) * 4);
+                // limit to twice the max window size plus one max sized block. With only window + block (as upstream had it),
+                // a frame whose window fills the buffer compacts (moves the whole window) before every block: O(window)
+                // copying per 128 KiB block. With 2x, compaction runs once per window's worth of output (one extra copy per byte).
+                newSize = min(newSize, 2L * maxWindowSize + MAX_BLOCK_SIZE);
+                // must allocate at least enough space for a max sized block
+                newSize = max(needed, newSize);
+                newSize = min(newSize, MAX_ARRAY_SIZE);
+                checkState(needed <= newSize, "Computed new window size buffer is not large enough");
+
+                int newWindowSize = toIntExact(newSize);
                 windowBase = Arrays.copyOf(windowBase, newWindowSize);
                 windowLimit = newWindowSize + ARRAY_BYTE_BASE_OFFSET;
             }
